@@ -135,4 +135,22 @@ Tensor& baddbmm_complex_out_xpu(
 #endif // USE_ONEMKL_XPU
 }
 
+// XPU implementation of mv using mm for better numerical stability
+Tensor mv_xpu(const Tensor& self, const Tensor& vec) {
+  TORCH_CHECK(self.dim() == 2, "mv expects a matrix");
+  TORCH_CHECK(vec.dim() == 1, "mv expects a vector");
+  TORCH_CHECK(self.size(1) == vec.size(0), "size mismatch");
+  
+  // Use direct mm instead of decomposition to avoid precision issues
+  // mv(A, v) = mm(A, v.unsqueeze(-1)).squeeze(-1)
+  Tensor vec_reshaped = vec.view({vec.size(0), 1});
+  Tensor result_2d = at::mm(self, vec_reshaped);
+  return result_2d.view({self.size(0)});
+}
+
+// Register XPU implementations
+TORCH_LIBRARY_IMPL(aten, XPU, m) {
+  m.impl("mv", TORCH_FN(mv_xpu));
+}
+
 } // namespace at::native
