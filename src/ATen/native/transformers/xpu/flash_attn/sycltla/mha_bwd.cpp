@@ -1665,17 +1665,39 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_attention_backward_sycltla(
           .get_info<
               sycl::ext::oneapi::experimental::info::device::architecture>();
   constexpr auto supported_architectures =
-      std::array<sycl::ext::oneapi::experimental::architecture, 3>{
+      std::array<sycl::ext::oneapi::experimental::architecture, 12>{
           sycl::ext::oneapi::experimental::architecture::intel_gpu_pvc,
           sycl::ext::oneapi::experimental::architecture::intel_gpu_pvc_vg,
-          sycl::ext::oneapi::experimental::architecture::intel_gpu_bmg_g21};
-  if (std::find(
-          supported_architectures.begin(),
-          supported_architectures.end(),
-          device_architecture) == supported_architectures.end()) {
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_bmg_g21,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_bmg_g31,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_dg1,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_acm_g10,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_acm_g11,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_acm_g12,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_mtl_u,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_mtl_h,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_arl_h,
+          sycl::ext::oneapi::experimental::architecture::intel_gpu_lnl_m};
+
+  bool is_supported = std::find(
+      supported_architectures.begin(),
+      supported_architectures.end(),
+      device_architecture) != supported_architectures.end();
+
+  // Check if it's an Intel GPU architecture (family AA = 00) even if not explicitly listed
+  uint64_t arch_value = static_cast<uint64_t>(device_architecture);
+  uint8_t arch_family = (arch_value >> 56) & 0xFF;  // Extract AA part
+  bool is_intel_gpu = (arch_family == 0x00);
+
+  if (!is_supported && !is_intel_gpu) {
     TORCH_CHECK(
         false,
-        "XPU device architecture does not support flash attention backward. Supported architectures are: intel_gpu_pvc, intel_gpu_pvc_vg, intel_gpu_bmg_g21.");
+        "XPU device architecture does not support flash attention backward. Supported architectures are: intel_gpu_pvc, intel_gpu_pvc_vg, intel_gpu_bmg_g21, and others.");
+  }
+
+  if (!is_supported && is_intel_gpu) {
+    std::cout << "Warning: Intel GPU architecture " << static_cast<int>(device_architecture) 
+              << " not explicitly supported for flash attention backward, but attempting to run anyway." << std::endl;
   }
 
   auto grad_query = at::empty_like(query);

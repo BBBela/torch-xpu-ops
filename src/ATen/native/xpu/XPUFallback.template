@@ -231,7 +231,6 @@ TORCH_LIBRARY_IMPL(aten, XPU, m) {
     "_cholesky_solve_helper",
     "dot",
     "_efficient_attention_forward",
-    "_flash_attention_forward",
     "geqrf",
     "geqrf.a",
     "hash_tensor.out",
