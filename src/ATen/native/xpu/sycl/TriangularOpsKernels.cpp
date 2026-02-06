@@ -62,96 +62,135 @@ struct ApplyTriuTrilKernelFunctor {
         c10::multiply_integers(self_info_.sizes, self_info_.sizes + dims - 2);
 
     for (IndexType batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-      // Compute batch offsets for all dimensions except the last 2
-      IndexType self_batch_offset = 0, result_batch_offset = 0;
-      IndexType running_batch = batch_idx;
-
-      for (int i = dims - 3; i >= 0; --i) {
-        IndexType dim_idx = running_batch % self_info_.sizes[i];
-        running_batch /= self_info_.sizes[i];
-        self_batch_offset += dim_idx * self_info_.strides[i];
-        result_batch_offset += dim_idx * result_info_.strides[i];
-      }
-
-      // Add row and column offsets
-      IndexType self_offset = self_batch_offset +
-                              row * self_info_.strides[dims - 2] +
-                              col_start * self_info_.strides[dims - 1];
-      IndexType result_offset = result_batch_offset +
-                                row * result_info_.strides[dims - 2] +
-                                col_start * result_info_.strides[dims - 1];
-
+      auto [self_offset, result_offset] = compute_offsets(batch_idx, row, col_start, dims);
+      
       if constexpr (inplace) {
-        // Early exit optimization for inplace
-        bool all_masked = upper ? (col_start - row >= k_) : (col_start + cols_per_block - row <= k_);
-        if (all_masked) continue;
-
-        // Process elements with unrolled loop for better performance
-#pragma unroll
-        for (int i = 0; i < cols_per_block; ++i) {
-          IndexType col = col_start + i;
-          if (col >= self_info_.sizes[dims - 1]) break;
-
-          bool mask = upper ? (col - row >= k_) : (col - row <= k_);
-          if (!mask) {
-            result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = scalar_t(0);
-          }
-        }
+        process_inplace_block(row, col_start, cols_per_block, self_offset, result_offset, dims);
       } else {
-        // Early exit optimizations for non-inplace case
-        bool all_zero = upper ? (col_start + cols_per_block - 1 - row < k_) : (col_start - row > k_);
-        bool all_copy = upper ? (col_start - row >= k_) : (col_start + cols_per_block - 1 - row <= k_);
-
-        if (all_zero) {
-          // All elements in this block should be zero
-#pragma unroll
-          for (int i = 0; i < cols_per_block; ++i) {
-            IndexType col = col_start + i;
-            if (col < self_info_.sizes[dims - 1]) {
-              result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = scalar_t(0);
-            }
-          }
-        } else if (all_copy) {
-          // All elements in this block should be copied directly
-#pragma unroll
-          for (int i = 0; i < cols_per_block; ++i) {
-            IndexType col = col_start + i;
-            if (col < self_info_.sizes[dims - 1]) {
-              result_info_.data[result_offset + i * result_info_.strides[dims - 1]] =
-                  self_info_.data[self_offset + i * self_info_.strides[dims - 1]];
-            }
-          }
-        } else {
-          // Mixed case - need per-element masking
-          // Load data into local array for better memory coalescing
-          scalar_t values[elements_per_thread];
-          bool masks[elements_per_thread];
-
-          // Compute masks and load values in unrolled loops
-#pragma unroll
-          for (int i = 0; i < cols_per_block; ++i) {
-            IndexType col = col_start + i;
-            if (col < self_info_.sizes[dims - 1]) {
-              masks[i] = upper ? (col - row >= k_) : (col - row <= k_);
-              values[i] = masks[i] ? self_info_.data[self_offset + i * self_info_.strides[dims - 1]] : scalar_t(0);
-            } else {
-              values[i] = scalar_t(0);
-            }
-          }
-
-          // Store results with unrolled loop
-#pragma unroll
-          for (int i = 0; i < cols_per_block; ++i) {
-            IndexType col = col_start + i;
-            if (col < self_info_.sizes[dims - 1]) {
-              result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = values[i];
-            }
-          }
-        }
+        process_outofplace_block(row, col_start, cols_per_block, self_offset, result_offset, dims);
       }
     }
   }
 
+private:
+  inline std::tuple<IndexType, IndexType> compute_offsets(
+      IndexType batch_idx, IndexType row, IndexType col_start, int dims) const {
+    // Compute batch offsets for all dimensions except the last 2
+    IndexType self_batch_offset = 0, result_batch_offset = 0;
+    IndexType running_batch = batch_idx;
+
+    for (int i = dims - 3; i >= 0; --i) {
+      IndexType dim_idx = running_batch % self_info_.sizes[i];
+      running_batch /= self_info_.sizes[i];
+      self_batch_offset += dim_idx * self_info_.strides[i];
+      result_batch_offset += dim_idx * result_info_.strides[i];
+    }
+
+    // Add row and column offsets
+    IndexType self_offset = self_batch_offset +
+                            row * self_info_.strides[dims - 2] +
+                            col_start * self_info_.strides[dims - 1];
+    IndexType result_offset = result_batch_offset +
+                              row * result_info_.strides[dims - 2] +
+                              col_start * result_info_.strides[dims - 1];
+    
+    return std::make_tuple(self_offset, result_offset);
+  }
+
+  inline void process_inplace_block(
+      IndexType row, IndexType col_start, IndexType cols_per_block,
+      IndexType self_offset, IndexType result_offset, int dims) const {
+    // Early exit optimization for inplace
+    bool all_masked = upper ? (col_start - row >= k_) : (col_start + cols_per_block - row <= k_);
+    if (all_masked) return;
+
+    // Process elements with unrolled loop for better performance
+#pragma unroll
+    for (int i = 0; i < elements_per_thread; ++i) {
+      IndexType col = col_start + i;
+      if (col >= self_info_.sizes[dims - 1]) break;
+
+      bool mask = upper ? (col - row >= k_) : (col - row <= k_);
+      if (!mask) {
+        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = scalar_t(0);
+      }
+    }
+  }
+
+  inline void process_outofplace_block(
+      IndexType row, IndexType col_start, IndexType cols_per_block,
+      IndexType self_offset, IndexType result_offset, int dims) const {
+    // Early exit optimizations for non-inplace case
+    bool all_zero = upper ? (col_start + cols_per_block - 1 - row < k_) : (col_start - row > k_);
+    bool all_copy = upper ? (col_start - row >= k_) : (col_start + cols_per_block - 1 - row <= k_);
+
+    if (all_zero) {
+      process_all_zero_block(col_start, cols_per_block, result_offset, dims);
+    } else if (all_copy) {
+      process_all_copy_block(col_start, cols_per_block, self_offset, result_offset, dims);
+    } else {
+      process_mixed_block(row, col_start, cols_per_block, self_offset, result_offset, dims);
+    }
+  }
+
+  inline void process_all_zero_block(
+      IndexType col_start, IndexType cols_per_block,
+      IndexType result_offset, int dims) const {
+    // All elements in this block should be zero
+#pragma unroll
+    for (int i = 0; i < elements_per_thread; ++i) {
+      IndexType col = col_start + i;
+      if (col < self_info_.sizes[dims - 1]) {
+        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = scalar_t(0);
+      }
+    }
+  }
+
+  inline void process_all_copy_block(
+      IndexType col_start, IndexType cols_per_block,
+      IndexType self_offset, IndexType result_offset, int dims) const {
+    // All elements in this block should be copied directly
+#pragma unroll
+    for (int i = 0; i < elements_per_thread; ++i) {
+      IndexType col = col_start + i;
+      if (col < self_info_.sizes[dims - 1]) {
+        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] =
+            self_info_.data[self_offset + i * self_info_.strides[dims - 1]];
+      }
+    }
+  }
+
+  inline void process_mixed_block(
+      IndexType row, IndexType col_start, IndexType cols_per_block,
+      IndexType self_offset, IndexType result_offset, int dims) const {
+    // Mixed case - need per-element masking
+    // Load data into local array for better memory coalescing
+    scalar_t values[elements_per_thread];
+    bool masks[elements_per_thread];
+
+    // Compute masks and load values in unrolled loops
+#pragma unroll
+    for (int i = 0; i < elements_per_thread; ++i) {
+      IndexType col = col_start + i;
+      if (col < self_info_.sizes[dims - 1]) {
+        masks[i] = upper ? (col - row >= k_) : (col - row <= k_);
+        values[i] = masks[i] ? self_info_.data[self_offset + i * self_info_.strides[dims - 1]] : scalar_t(0);
+      } else {
+        values[i] = scalar_t(0);
+      }
+    }
+
+    // Store results with unrolled loop
+#pragma unroll
+    for (int i = 0; i < elements_per_thread; ++i) {
+      IndexType col = col_start + i;
+      if (col < self_info_.sizes[dims - 1]) {
+        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = values[i];
+      }
+    }
+  }
+
+public:
   ApplyTriuTrilKernelFunctor(
       at::xpu::detail::TensorInfo<scalar_t, IndexType> result_info,
       at::xpu::detail::TensorInfo<const scalar_t, IndexType> self_info,
