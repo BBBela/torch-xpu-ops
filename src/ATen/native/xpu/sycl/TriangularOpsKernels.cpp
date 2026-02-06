@@ -40,11 +40,10 @@ template <
     typename scalar_t,
     typename IndexType,
     bool upper,
-    int elements_per_thread,
     bool inplace>
 struct ApplyTriuTrilKernelFunctor {
   void operator()(sycl::nd_item<1> item) const {
-    IndexType linear_idx = item.get_global_id(0) * elements_per_thread;
+    IndexType linear_idx = item.get_global_id(0) * elements_per_thread_;
     if (linear_idx >= N_padded_) {
       return;
     }
@@ -57,7 +56,7 @@ struct ApplyTriuTrilKernelFunctor {
 
     if constexpr (inplace) {
       bool mask_all_true =
-          upper ? (col - row >= k_) : (col + elements_per_thread - row <= k_);
+          upper ? (col - row >= k_) : (col + elements_per_thread_ - row <= k_);
       if (mask_all_true)
         return;
     }
@@ -80,9 +79,8 @@ struct ApplyTriuTrilKernelFunctor {
     }
 
     if constexpr (inplace) {
-#pragma unroll
       for (int i = 0;
-           i < elements_per_thread && col + i < self_info_.sizes[dims - 1];
+           i < elements_per_thread_ && col + i < self_info_.sizes[dims - 1];
            i++) {
         bool mask = upper ? (col + i - row >= k_) : (col + i - row <= k_);
         if (!mask)
@@ -91,30 +89,16 @@ struct ApplyTriuTrilKernelFunctor {
               scalar_t(0);
       }
     } else {
-      scalar_t frag[elements_per_thread] = {};
-      bool has_mask = (upper && col + elements_per_thread - row >= k_) ||
-          (!upper && col - row <= k_);
-      if (has_mask) {
-#pragma unroll
-        for (int i = 0;
-             i < elements_per_thread && col + i < self_info_.sizes[dims - 1];
-             i++)
-          frag[i] =
-              self_info_.data[self_offset + i * self_info_.strides[dims - 1]];
-
-#pragma unroll
-        for (int i = 0; i < elements_per_thread; i++) {
-          bool mask = upper ? (col + i - row >= k_) : (col + i - row <= k_);
-          frag[i] = mask ? frag[i] : scalar_t(0);
-        }
-      }
-
-#pragma unroll
+      // Process elements one by one without buffering
       for (int i = 0;
-           i < elements_per_thread && col + i < self_info_.sizes[dims - 1];
-           i++)
-        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] =
-            frag[i];
+           i < elements_per_thread_ && col + i < self_info_.sizes[dims - 1];
+           i++) {
+        bool mask = upper ? (col + i - row >= k_) : (col + i - row <= k_);
+        scalar_t value = mask ? 
+            self_info_.data[self_offset + i * self_info_.strides[dims - 1]] : 
+            scalar_t(0);
+        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = value;
+      }
     }
   }
   ApplyTriuTrilKernelFunctor(
@@ -122,12 +106,14 @@ struct ApplyTriuTrilKernelFunctor {
       at::xpu::detail::TensorInfo<const scalar_t, IndexType> self_info,
       const int64_t k,
       const int64_t N_padded,
-      const IndexType last_dim_padded)
+      const IndexType last_dim_padded,
+      const int elements_per_thread)
       : result_info_(result_info),
         self_info_(self_info),
         k_(k),
         N_padded_(N_padded),
-        last_dim_padded_(last_dim_padded) {}
+        last_dim_padded_(last_dim_padded),
+        elements_per_thread_(elements_per_thread) {}
 
  private:
   at::xpu::detail::TensorInfo<scalar_t, IndexType> result_info_;
@@ -135,43 +121,8 @@ struct ApplyTriuTrilKernelFunctor {
   const int64_t k_;
   const int64_t N_padded_;
   const IndexType last_dim_padded_;
+  const int elements_per_thread_;
 };
-
-template <typename scalar_t, typename IndexType, bool upper, int elements_per_thread>
-void apply_triu_tril_impl(
-    const Tensor& result,
-    const Tensor& self,
-    const int64_t k) {
-  auto sizes = self.sizes();
-  int64_t last_dim_padded =
-      round_up<int64_t>(sizes.back(), elements_per_thread);
-  int64_t N_padded =
-      c10::multiply_integers(sizes.begin(), sizes.end() - 1) * last_dim_padded;
-
-  int64_t local_range = syclMaxWorkItemsPerSubSlice();
-  int64_t global_range =
-      ((N_padded / elements_per_thread + local_range - 1) / local_range) *
-      local_range;
-
-  auto result_info =
-      at::xpu::detail::getTensorInfo<scalar_t, IndexType>(result);
-  auto self_info =
-      at::xpu::detail::getTensorInfo<const scalar_t, IndexType>(self);
-  BOOL_SWITCH(self.is_same(result), inplace, [&] {
-    ApplyTriuTrilKernelFunctor<
-        scalar_t,
-        IndexType,
-        upper,
-        elements_per_thread,
-        inplace>
-        kfn(result_info, self_info, k, N_padded, last_dim_padded);
-    sycl_kernel_submit(
-        sycl::range<1>(global_range),
-        sycl::range<1>(local_range),
-        getCurrentSYCLQueue(),
-        kfn);
-  });
-}
 
 template <typename scalar_t, typename IndexType, bool upper>
 void apply_triu_tril(
@@ -193,24 +144,34 @@ void apply_triu_tril(
     elements_per_thread *= 2;
   }
   
-  // Dispatch to the appropriate template instantiation based on calculated elements_per_thread
-  if (elements_per_thread == 1) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 1>(result, self, k);
-  } else if (elements_per_thread == 2) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 2>(result, self, k);
-  } else if (elements_per_thread == 4) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 4>(result, self, k);
-  } else if (elements_per_thread == 8) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 8>(result, self, k);
-  } else if (elements_per_thread == 16) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 16>(result, self, k);
-  } else if (elements_per_thread == 32) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 32>(result, self, k);
-  } else if (elements_per_thread == 64) {
-    apply_triu_tril_impl<scalar_t, IndexType, upper, 64>(result, self, k);
-  } else {
-    TORCH_CHECK(false, "Matrix too large for triu/tril operation. Elements per thread would be: ", elements_per_thread);
-  }
+  // Kernel setup and launch
+  int64_t last_dim_padded =
+      round_up<int64_t>(sizes.back(), elements_per_thread);
+  int64_t N_padded =
+      c10::multiply_integers(sizes.begin(), sizes.end() - 1) * last_dim_padded;
+
+  int64_t local_range = syclMaxWorkItemsPerSubSlice();
+  int64_t global_range =
+      ((N_padded / elements_per_thread + local_range - 1) / local_range) *
+      local_range;
+
+  auto result_info =
+      at::xpu::detail::getTensorInfo<scalar_t, IndexType>(result);
+  auto self_info =
+      at::xpu::detail::getTensorInfo<const scalar_t, IndexType>(self);
+  BOOL_SWITCH(self.is_same(result), inplace, [&] {
+    ApplyTriuTrilKernelFunctor<
+        scalar_t,
+        IndexType,
+        upper,
+        inplace>
+        kfn(result_info, self_info, k, N_padded, last_dim_padded, elements_per_thread);
+    sycl_kernel_submit(
+        sycl::range<1>(global_range),
+        sycl::range<1>(local_range),
+        getCurrentSYCLQueue(),
+        kfn);
+  });
 }
 
 #define TRIU_TRIL_LAMBDA(upper)                                   \
