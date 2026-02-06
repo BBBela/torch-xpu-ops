@@ -17,6 +17,7 @@
 #include <ATen/native/Resize.h>
 #include <comm/SYCLContext.h>
 #include <comm/TensorInfo.h>
+#include <limits>
 
 #include <ATen/native/xpu/sycl/TriangularOpsKernels.h>
 
@@ -136,13 +137,11 @@ struct ApplyTriuTrilKernelFunctor {
   const IndexType last_dim_padded_;
 };
 
-template <typename scalar_t, typename IndexType, bool upper>
-void apply_triu_tril(
+template <typename scalar_t, typename IndexType, bool upper, int elements_per_thread>
+void apply_triu_tril_impl(
     const Tensor& result,
     const Tensor& self,
     const int64_t k) {
-  constexpr int elements_per_thread =
-      sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
   auto sizes = self.sizes();
   int64_t last_dim_padded =
       round_up<int64_t>(sizes.back(), elements_per_thread);
@@ -172,6 +171,46 @@ void apply_triu_tril(
         getCurrentSYCLQueue(),
         kfn);
   });
+}
+
+template <typename scalar_t, typename IndexType, bool upper>
+void apply_triu_tril(
+    const Tensor& result,
+    const Tensor& self,
+    const int64_t k) {
+  constexpr int base_elements_per_thread =
+      sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
+  
+  auto sizes = self.sizes();
+  int64_t total_elements = c10::multiply_integers(sizes.begin(), sizes.end());
+  
+  // Calculate elements_per_thread to keep thread count within uint32 range
+  // Use conservative limit to account for padding and local_range alignment
+  constexpr int64_t max_threads = static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) / 2;
+  
+  int elements_per_thread = base_elements_per_thread;
+  while (total_elements / elements_per_thread > max_threads) {
+    elements_per_thread *= 2;
+  }
+  
+  // Dispatch to the appropriate template instantiation based on calculated elements_per_thread
+  if (elements_per_thread == 1) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 1>(result, self, k);
+  } else if (elements_per_thread == 2) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 2>(result, self, k);
+  } else if (elements_per_thread == 4) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 4>(result, self, k);
+  } else if (elements_per_thread == 8) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 8>(result, self, k);
+  } else if (elements_per_thread == 16) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 16>(result, self, k);
+  } else if (elements_per_thread == 32) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 32>(result, self, k);
+  } else if (elements_per_thread == 64) {
+    apply_triu_tril_impl<scalar_t, IndexType, upper, 64>(result, self, k);
+  } else {
+    TORCH_CHECK(false, "Matrix too large for triu/tril operation. Elements per thread would be: ", elements_per_thread);
+  }
 }
 
 #define TRIU_TRIL_LAMBDA(upper)                                   \
