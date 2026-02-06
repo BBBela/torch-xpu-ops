@@ -43,54 +43,55 @@ template <
     bool upper,
     int elements_per_thread,
     bool inplace>
-struct ApplyTriuTrilKernel2DFunctor {
+struct ApplyTriuTrilKernelFunctor {
   void operator()(sycl::nd_item<2> item) const {
     // Get 2D coordinates: row and column block
     IndexType row = item.get_global_id(0);
     IndexType col_block = item.get_global_id(1);
-    
+
     if (row >= matrix_rows_ || col_block >= col_blocks_) {
       return;
     }
-    
+
     auto dims = self_info_.dims;
     constexpr IndexType cols_per_block = elements_per_thread;
     IndexType col_start = col_block * cols_per_block;
-    
+
     // Compute batch offset (everything except last 2 dimensions)
-    IndexType batch_size = c10::multiply_integers(self_info_.sizes, self_info_.sizes + dims - 2);
-    
+    IndexType batch_size =
+        c10::multiply_integers(self_info_.sizes, self_info_.sizes + dims - 2);
+
     for (IndexType batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
       // Compute batch offsets for all dimensions except the last 2
       IndexType self_batch_offset = 0, result_batch_offset = 0;
       IndexType running_batch = batch_idx;
-      
+
       for (int i = dims - 3; i >= 0; --i) {
         IndexType dim_idx = running_batch % self_info_.sizes[i];
         running_batch /= self_info_.sizes[i];
         self_batch_offset += dim_idx * self_info_.strides[i];
         result_batch_offset += dim_idx * result_info_.strides[i];
       }
-      
+
       // Add row and column offsets
-      IndexType self_offset = self_batch_offset + 
-                              row * self_info_.strides[dims - 2] + 
+      IndexType self_offset = self_batch_offset +
+                              row * self_info_.strides[dims - 2] +
                               col_start * self_info_.strides[dims - 1];
-      IndexType result_offset = result_batch_offset + 
-                                row * result_info_.strides[dims - 2] + 
+      IndexType result_offset = result_batch_offset +
+                                row * result_info_.strides[dims - 2] +
                                 col_start * result_info_.strides[dims - 1];
-      
+
       if constexpr (inplace) {
         // Early exit optimization for inplace
         bool all_masked = upper ? (col_start - row >= k_) : (col_start + cols_per_block - row <= k_);
         if (all_masked) continue;
-        
+
         // Process elements with unrolled loop for better performance
 #pragma unroll
         for (int i = 0; i < cols_per_block; ++i) {
           IndexType col = col_start + i;
           if (col >= self_info_.sizes[dims - 1]) break;
-          
+
           bool mask = upper ? (col - row >= k_) : (col - row <= k_);
           if (!mask) {
             result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = scalar_t(0);
@@ -100,7 +101,7 @@ struct ApplyTriuTrilKernel2DFunctor {
         // Early exit optimizations for non-inplace case
         bool all_zero = upper ? (col_start + cols_per_block - 1 - row < k_) : (col_start - row > k_);
         bool all_copy = upper ? (col_start - row >= k_) : (col_start + cols_per_block - 1 - row <= k_);
-        
+
         if (all_zero) {
           // All elements in this block should be zero
 #pragma unroll
@@ -116,7 +117,7 @@ struct ApplyTriuTrilKernel2DFunctor {
           for (int i = 0; i < cols_per_block; ++i) {
             IndexType col = col_start + i;
             if (col < self_info_.sizes[dims - 1]) {
-              result_info_.data[result_offset + i * result_info_.strides[dims - 1]] = 
+              result_info_.data[result_offset + i * result_info_.strides[dims - 1]] =
                   self_info_.data[self_offset + i * self_info_.strides[dims - 1]];
             }
           }
@@ -125,7 +126,7 @@ struct ApplyTriuTrilKernel2DFunctor {
           // Load data into local array for better memory coalescing
           scalar_t values[elements_per_thread];
           bool masks[elements_per_thread];
-          
+
           // Compute masks and load values in unrolled loops
 #pragma unroll
           for (int i = 0; i < cols_per_block; ++i) {
@@ -137,7 +138,7 @@ struct ApplyTriuTrilKernel2DFunctor {
               values[i] = scalar_t(0);
             }
           }
-          
+
           // Store results with unrolled loop
 #pragma unroll
           for (int i = 0; i < cols_per_block; ++i) {
@@ -150,8 +151,8 @@ struct ApplyTriuTrilKernel2DFunctor {
       }
     }
   }
-  
-  ApplyTriuTrilKernel2DFunctor(
+
+  ApplyTriuTrilKernelFunctor(
       at::xpu::detail::TensorInfo<scalar_t, IndexType> result_info,
       at::xpu::detail::TensorInfo<const scalar_t, IndexType> self_info,
       const int64_t k,
@@ -171,34 +172,37 @@ struct ApplyTriuTrilKernel2DFunctor {
   const IndexType col_blocks_;
 };
 
-template <typename scalar_t, typename IndexType, bool upper, int elements_per_thread>
-void apply_triu_tril_2d(
+template <typename scalar_t, typename IndexType, bool upper>
+void apply_triu_tril(
     const Tensor& result,
     const Tensor& self,
     const int64_t k) {
+  constexpr int elements_per_thread =
+      sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
+
   auto sizes = self.sizes();
   auto dims = sizes.size();
-  
+
   IndexType matrix_rows = sizes[dims - 2];
   IndexType matrix_cols = sizes[dims - 1];
-  
+
   constexpr int64_t max_uint32 = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
   constexpr int64_t max_dim_size = max_uint32 / 2; // Conservative limit
-  
+
   // Ensure matrix_rows fits in uint32
   if (matrix_rows > max_dim_size) {
     TORCH_CHECK(false, "Matrix has too many rows (", matrix_rows, ") for 2D kernel. Maximum supported: ", max_dim_size);
   }
-  
+
   int64_t col_blocks = (matrix_cols + elements_per_thread - 1) / elements_per_thread;
-  
+
   // Use 2D grid: rows x column_blocks
   int64_t local_range_x = 16; // rows per workgroup
   int64_t local_range_y = 16; // column blocks per workgroup
-  
+
   int64_t global_range_x = ((matrix_rows + local_range_x - 1) / local_range_x) * local_range_x;
   int64_t global_range_y = ((col_blocks + local_range_y - 1) / local_range_y) * local_range_y;
-  
+
   // Final safety checks
   TORCH_CHECK(global_range_x <= max_uint32, "Computed global_range_x (", global_range_x, ") exceeds uint32 maximum");
   TORCH_CHECK(global_range_y <= max_uint32, "Computed global_range_y (", global_range_y, ") exceeds uint32 maximum");
@@ -207,9 +211,9 @@ void apply_triu_tril_2d(
       at::xpu::detail::getTensorInfo<scalar_t, IndexType>(result);
   auto self_info =
       at::xpu::detail::getTensorInfo<const scalar_t, IndexType>(self);
-      
+
   BOOL_SWITCH(self.is_same(result), inplace, [&] {
-    ApplyTriuTrilKernel2DFunctor<
+    ApplyTriuTrilKernelFunctor<
         scalar_t,
         IndexType,
         upper,
@@ -222,18 +226,6 @@ void apply_triu_tril_2d(
         getCurrentSYCLQueue(),
         kfn);
   });
-}
-
-template <typename scalar_t, typename IndexType, bool upper>
-void apply_triu_tril(
-    const Tensor& result,
-    const Tensor& self,
-    const int64_t k) {
-  constexpr int base_elements_per_thread =
-      sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
-  
-  // Always use 2D kernel for all matrix sizes
-  apply_triu_tril_2d<scalar_t, IndexType, upper, base_elements_per_thread>(result, self, k);
 }
 
 #define TRIU_TRIL_LAMBDA(upper)                                   \
