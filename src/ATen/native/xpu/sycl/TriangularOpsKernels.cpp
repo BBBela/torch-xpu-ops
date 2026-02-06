@@ -40,8 +40,110 @@ template <
     typename scalar_t,
     typename IndexType,
     bool upper,
+    int elements_per_thread,
     bool inplace>
 struct ApplyTriuTrilKernelFunctor {
+  void operator()(sycl::nd_item<1> item) const {
+    IndexType linear_idx = item.get_global_id(0) * elements_per_thread;
+    if (linear_idx >= N_padded_) {
+      return;
+    }
+    auto dims = self_info_.dims;
+
+    // Compute column index amd row index
+    IndexType col = linear_idx % last_dim_padded_;
+    linear_idx /= last_dim_padded_;
+    IndexType row = linear_idx % self_info_.sizes[dims - 2];
+
+    if constexpr (inplace) {
+      bool mask_all_true =
+          upper ? (col - row >= k_) : (col + elements_per_thread - row <= k_);
+      if (mask_all_true)
+        return;
+    }
+
+    // Compute offset
+    IndexType self_offset = 0, result_offset = 0;
+    self_offset += self_info_.strides[dims - 1] * col;
+    result_offset += result_info_.strides[dims - 1] * col;
+    linear_idx /= self_info_.sizes[dims - 2];
+    self_offset += self_info_.strides[dims - 2] * row;
+    result_offset += result_info_.strides[dims - 2] * row;
+
+    // Compute remaining offsets
+    IndexType running_index;
+    for (int i = dims - 3; i >= 0; --i) {
+      running_index = linear_idx % self_info_.sizes[i];
+      linear_idx /= self_info_.sizes[i];
+      self_offset += running_index * self_info_.strides[i];
+      result_offset += running_index * result_info_.strides[i];
+    }
+
+    if constexpr (inplace) {
+#pragma unroll
+      for (int i = 0;
+           i < elements_per_thread && col + i < self_info_.sizes[dims - 1];
+           i++) {
+        bool mask = upper ? (col + i - row >= k_) : (col + i - row <= k_);
+        if (!mask)
+          result_info_
+              .data[result_offset + i * result_info_.strides[dims - 1]] =
+              scalar_t(0);
+      }
+    } else {
+      scalar_t frag[elements_per_thread] = {};
+      bool has_mask = (upper && col + elements_per_thread - row >= k_) ||
+          (!upper && col - row <= k_);
+      if (has_mask) {
+#pragma unroll
+        for (int i = 0;
+             i < elements_per_thread && col + i < self_info_.sizes[dims - 1];
+             i++)
+          frag[i] =
+              self_info_.data[self_offset + i * self_info_.strides[dims - 1]];
+
+#pragma unroll
+        for (int i = 0; i < elements_per_thread; i++) {
+          bool mask = upper ? (col + i - row >= k_) : (col + i - row <= k_);
+          frag[i] = mask ? frag[i] : scalar_t(0);
+        }
+      }
+
+#pragma unroll
+      for (int i = 0;
+           i < elements_per_thread && col + i < self_info_.sizes[dims - 1];
+           i++)
+        result_info_.data[result_offset + i * result_info_.strides[dims - 1]] =
+            frag[i];
+    }
+  }
+  ApplyTriuTrilKernelFunctor(
+      at::xpu::detail::TensorInfo<scalar_t, IndexType> result_info,
+      at::xpu::detail::TensorInfo<const scalar_t, IndexType> self_info,
+      const int64_t k,
+      const int64_t N_padded,
+      const IndexType last_dim_padded)
+      : result_info_(result_info),
+        self_info_(self_info),
+        k_(k),
+        N_padded_(N_padded),
+        last_dim_padded_(last_dim_padded) {}
+
+ private:
+  at::xpu::detail::TensorInfo<scalar_t, IndexType> result_info_;
+  at::xpu::detail::TensorInfo<const scalar_t, IndexType> self_info_;
+  const int64_t k_;
+  const int64_t N_padded_;
+  const IndexType last_dim_padded_;
+};
+
+// Dynamic kernel for very large matrices
+template <
+    typename scalar_t,
+    typename IndexType,
+    bool upper,
+    bool inplace>
+struct ApplyTriuTrilKernelFunctorDynamic {
   void operator()(sycl::nd_item<1> item) const {
     IndexType linear_idx = item.get_global_id(0) * elements_per_thread_;
     if (linear_idx >= N_padded_) {
@@ -101,7 +203,7 @@ struct ApplyTriuTrilKernelFunctor {
       }
     }
   }
-  ApplyTriuTrilKernelFunctor(
+  ApplyTriuTrilKernelFunctorDynamic(
       at::xpu::detail::TensorInfo<scalar_t, IndexType> result_info,
       at::xpu::detail::TensorInfo<const scalar_t, IndexType> self_info,
       const int64_t k,
@@ -124,27 +226,12 @@ struct ApplyTriuTrilKernelFunctor {
   const int elements_per_thread_;
 };
 
-template <typename scalar_t, typename IndexType, bool upper>
-void apply_triu_tril(
+template <typename scalar_t, typename IndexType, bool upper, int elements_per_thread>
+void apply_triu_tril_impl(
     const Tensor& result,
     const Tensor& self,
     const int64_t k) {
-  constexpr int base_elements_per_thread =
-      sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
-  
   auto sizes = self.sizes();
-  int64_t total_elements = c10::multiply_integers(sizes.begin(), sizes.end());
-  
-  // Calculate elements_per_thread to keep thread count within uint32 range
-  // Use conservative limit to account for padding and local_range alignment
-  constexpr int64_t max_threads = static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) / 2;
-  
-  int elements_per_thread = base_elements_per_thread;
-  while (total_elements / elements_per_thread > max_threads) {
-    elements_per_thread *= 2;
-  }
-  
-  // Kernel setup and launch
   int64_t last_dim_padded =
       round_up<int64_t>(sizes.back(), elements_per_thread);
   int64_t N_padded =
@@ -164,6 +251,43 @@ void apply_triu_tril(
         scalar_t,
         IndexType,
         upper,
+        elements_per_thread,
+        inplace>
+        kfn(result_info, self_info, k, N_padded, last_dim_padded);
+    sycl_kernel_submit(
+        sycl::range<1>(global_range),
+        sycl::range<1>(local_range),
+        getCurrentSYCLQueue(),
+        kfn);
+  });
+}
+
+template <typename scalar_t, typename IndexType, bool upper>
+void apply_triu_tril_dynamic(
+    const Tensor& result,
+    const Tensor& self,
+    const int64_t k,
+    const int elements_per_thread) {
+  auto sizes = self.sizes();
+  int64_t last_dim_padded =
+      round_up<int64_t>(sizes.back(), elements_per_thread);
+  int64_t N_padded =
+      c10::multiply_integers(sizes.begin(), sizes.end() - 1) * last_dim_padded;
+
+  int64_t local_range = syclMaxWorkItemsPerSubSlice();
+  int64_t global_range =
+      ((N_padded / elements_per_thread + local_range - 1) / local_range) *
+      local_range;
+
+  auto result_info =
+      at::xpu::detail::getTensorInfo<scalar_t, IndexType>(result);
+  auto self_info =
+      at::xpu::detail::getTensorInfo<const scalar_t, IndexType>(self);
+  BOOL_SWITCH(self.is_same(result), inplace, [&] {
+    ApplyTriuTrilKernelFunctorDynamic<
+        scalar_t,
+        IndexType,
+        upper,
         inplace>
         kfn(result_info, self_info, k, N_padded, last_dim_padded, elements_per_thread);
     sycl_kernel_submit(
@@ -172,6 +296,35 @@ void apply_triu_tril(
         getCurrentSYCLQueue(),
         kfn);
   });
+}
+
+template <typename scalar_t, typename IndexType, bool upper>
+void apply_triu_tril(
+    const Tensor& result,
+    const Tensor& self,
+    const int64_t k) {
+  constexpr int base_elements_per_thread =
+      sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
+  
+  auto sizes = self.sizes();
+  int64_t total_elements = c10::multiply_integers(sizes.begin(), sizes.end());
+  
+  // Check if we can use the fast template-based kernel
+  constexpr int64_t max_threads = static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) / 2;
+  
+  int64_t thread_count = total_elements / base_elements_per_thread;
+  
+  if (thread_count <= max_threads) {
+    // Use high-performance template-based kernel
+    apply_triu_tril_impl<scalar_t, IndexType, upper, base_elements_per_thread>(result, self, k);
+  } else {
+    // Matrix is too large for template kernel, use dynamic kernel
+    int elements_per_thread = base_elements_per_thread;
+    while (total_elements / elements_per_thread > max_threads) {
+      elements_per_thread *= 2;
+    }
+    apply_triu_tril_dynamic<scalar_t, IndexType, upper>(result, self, k, elements_per_thread);
+  }
 }
 
 #define TRIU_TRIL_LAMBDA(upper)                                   \
