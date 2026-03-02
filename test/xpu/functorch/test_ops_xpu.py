@@ -2448,6 +2448,7 @@ class TestOperators(TestCase):
         ),
     )
     def test_vmap_autograd_grad(self, device, dtype, op):
+        print("\nEntering the function\n")
         def is_differentiable(inp):
             return isinstance(inp, Tensor) and (
                 inp.grad_fn is not None or inp.requires_grad
@@ -2509,6 +2510,7 @@ class TestOperators(TestCase):
                 is_batch_norm_and_training=is_batch_norm_and_training,
             )
             for loop_out, batched_out in generator:
+                print("\nIn assert!\n")
                 self.assertEqual(loop_out, batched_out)
 
     def test_vmapvmapjvp_linalg_solve(self):

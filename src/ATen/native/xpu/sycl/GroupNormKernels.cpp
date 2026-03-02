@@ -778,9 +778,38 @@ void group_norm_1d_backward(
     Tensor& dX,
     Tensor& dgamma,
     Tensor& dbeta) {
+
   using T_ACC = acc_type_device<T, kXPU>;
   const int64_t G = group;
   const int64_t D = C / G;
+
+  static int call_1d_counter = 0;
+  call_1d_counter++;
+  std::cout << "[XPU 1D DEBUG] group_norm_1d_backward ENTRY #" << call_1d_counter << std::endl;
+  std::cout << "[XPU 1D DEBUG] N=" << N << ", C=" << C << ", G=" << G << ", D=" << D << std::endl;
+  std::cout << "[XPU 1D DEBUG] dY shape: [";
+  for (int i = 0; i < dY.dim(); ++i) {
+    std::cout << dY.size(i);
+    if (i < dY.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "], values: ";
+  auto dY_flat = dY.flatten();
+  for (int i = 0; i < std::min(4, (int)dY_flat.numel()); ++i) {
+    std::cout << dY_flat[i].item<float>();
+    if (i < 3 && i < dY_flat.numel() - 1) std::cout << ", ";
+  }
+  std::cout << std::endl;
+  std::cout << "[XPU 1D DEBUG] mean shape: [";
+  for (int i = 0; i < mean.dim(); ++i) {
+    std::cout << mean.size(i);
+    if (i < mean.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "], rstd shape: [";
+  for (int i = 0; i < rstd.dim(); ++i) {
+    std::cout << rstd.size(i);
+    if (i < rstd.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "]" << std::endl;
   const T* dY_data = dY.const_data_ptr<T>();
   const T* X_data = X.const_data_ptr<T>();
   const T* mean_data = mean.const_data_ptr<T>();
@@ -894,6 +923,23 @@ void group_norm_1d_backward(
           dbeta_data);
     }
   }
+
+  // DEBUG: Track 1D function output
+  if (dX.defined()) {
+    std::cout << "[XPU 1D DEBUG] dX output shape: [";
+    for (int i = 0; i < dX.dim(); ++i) {
+      std::cout << dX.size(i);
+      if (i < dX.dim() - 1) std::cout << ", ";
+    }
+    std::cout << "], values: ";
+    auto dX_flat = dX.flatten();
+    for (int i = 0; i < std::min(4, (int)dX_flat.numel()); ++i) {
+      std::cout << dX_flat[i].item<float>();
+      if (i < 3 && i < dX_flat.numel() - 1) std::cout << ", ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << "[XPU 1D DEBUG] group_norm_1d_backward COMPLETED #" << call_1d_counter << std::endl;
 }
 
 template <typename T, int SIMD>
@@ -1324,8 +1370,50 @@ void group_norm_backward_kernel_impl(
     Tensor& dX,
     Tensor& dgamma,
     Tensor& dbeta) {
+
+  // DEBUG: Track kernel call parameters
+  static int call_counter = 0;
+  call_counter++;
+  std::cout << "[XPU DEBUG] group_norm_backward_kernel_impl ENTRY #" << call_counter << std::endl;
+  std::cout << "[XPU DEBUG] N=" << N << ", C=" << C << ", HxW=" << HxW << ", group=" << group << std::endl;
+  std::cout << "[XPU DEBUG] dY_ shape: [";
+  for (int i = 0; i < dY_.dim(); ++i) {
+    std::cout << dY_.size(i);
+    if (i < dY_.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "], strides: [";
+  for (int i = 0; i < dY_.dim(); ++i) {
+    std::cout << dY_.stride(i);
+    if (i < dY_.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "]" << std::endl;
+  std::cout << "[XPU DEBUG] X_ shape: [";
+  for (int i = 0; i < X_.dim(); ++i) {
+    std::cout << X_.size(i);
+    if (i < X_.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "], strides: [";
+  for (int i = 0; i < X_.dim(); ++i) {
+    std::cout << X_.stride(i);
+    if (i < X_.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "]" << std::endl;
+
   auto dY = dY_.contiguous();
   auto X = X_.contiguous();
+
+  std::cout << "[XPU DEBUG] After contiguous - dY shape: [";
+  for (int i = 0; i < dY.dim(); ++i) {
+    std::cout << dY.size(i);
+    if (i < dY.dim() - 1) std::cout << ", ";
+  }
+  std::cout << "], values: ";
+  auto dY_flat = dY.flatten();
+  for (int i = 0; i < std::min(4, (int)dY_flat.numel()); ++i) {
+    std::cout << dY_flat[i].item<float>();
+    if (i < 3 && i < dY_flat.numel() - 1) std::cout << ", ";
+  }
+  std::cout << std::endl;
 
   using T_ACC = acc_type_device<T, kXPU>;
   const int64_t G = group;
@@ -1361,10 +1449,14 @@ void group_norm_backward_kernel_impl(
   T_ACC* db_data = db.mutable_data_ptr<T_ACC>();
 
   if (HxW == 1) {
+    std::cout << "[XPU DEBUG] Taking 1D path for call #" << call_counter << std::endl;
     group_norm_1d_backward<T>(
         dY, X, mean, rstd, gamma, N, C, G, dX, dgamma, dbeta);
+    std::cout << "[XPU DEBUG] 1D path completed for call #" << call_counter << std::endl;
     return;
   }
+
+  std::cout << "[XPU DEBUG] Taking 2D path for call #" << call_counter << std::endl;
 
   auto& queue = getCurrentSYCLQueue();
   int64_t simd = syclMaxSubGroupSize();
