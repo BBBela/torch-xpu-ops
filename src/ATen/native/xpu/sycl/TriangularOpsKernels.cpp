@@ -42,8 +42,11 @@ template <
     int elements_per_thread,
     bool inplace>
 struct ApplyTriuTrilKernelFunctor {
-  void operator()(sycl::nd_item<1> item) const {
-    IndexType linear_idx = item.get_global_id(0) * elements_per_thread;
+  void operator()(sycl::nd_item<2> item) const {
+    IndexType linear_idx =
+        (item.get_global_id(0) * item.get_global_range(1) +
+         item.get_global_id(1)) *
+        elements_per_thread;
     if (linear_idx >= N_padded_) {
       return;
     }
@@ -149,10 +152,14 @@ void apply_triu_tril(
   int64_t N_padded =
       c10::multiply_integers(sizes.begin(), sizes.end() - 1) * last_dim_padded;
 
-  int64_t local_range = syclMaxWorkItemsPerSubSlice();
-  int64_t global_range =
-      ((N_padded / elements_per_thread + local_range - 1) / local_range) *
-      local_range;
+  int64_t local_range_x = syclMaxWorkItemsPerSubSlice();
+  int64_t local_range_y = 1;
+  int64_t num_work_groups =
+      ceil_div(N_padded / elements_per_thread, local_range_x);
+  int64_t work_groups_x = static_cast<int64_t>(std::sqrt(num_work_groups)) + 1;
+  int64_t work_groups_y = ceil_div(num_work_groups, work_groups_x);
+  int64_t global_range_x = work_groups_x * local_range_x;
+  int64_t global_range_y = work_groups_y * local_range_y;
 
   auto result_info =
       at::xpu::detail::getTensorInfo<scalar_t, IndexType>(result);
@@ -167,8 +174,8 @@ void apply_triu_tril(
         inplace>
         kfn(result_info, self_info, k, N_padded, last_dim_padded);
     sycl_kernel_submit(
-        sycl::range<1>(global_range),
-        sycl::range<1>(local_range),
+        sycl::range<2>(global_range_y, global_range_x),
+        sycl::range<2>(local_range_y, local_range_x),
         getCurrentSYCLQueue(),
         kfn);
   });
