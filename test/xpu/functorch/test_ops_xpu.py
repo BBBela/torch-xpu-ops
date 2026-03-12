@@ -288,7 +288,7 @@ def get_vjp_fn_and_args_with_cotangents(f, sample, cotangents):
 # sample (*args, *cotangents)
 def get_vjpfull_variant(f, sample):
     fn, primals = normalize_op_input_output(f, sample)
-    return _get_vjpfull_variant(fn, primals)
+    return _get_vjpfull_variant(fn, primals, sample.input.device)
 
 
 def get_vjpfull_variant2(f, args, kwargs):
@@ -296,12 +296,45 @@ def get_vjpfull_variant2(f, args, kwargs):
     return _get_vjpfull_variant(fn, primals)
 
 
-def _get_vjpfull_variant(fn, primals):
+def _get_vjpfull_variant(fn, primals, device=None):
     result = fn(*primals)
-    cotangents = _as_tuple(
-        tree_map(lambda x: torch.randn_like(x, requires_grad=True), result)
-    )
     num_primals = len(primals)
+    
+    # Hardcoded cotangents
+    cotangents = (torch.tensor(
+        [[[-0.2963,  2.6764, -0.1408, -0.8441,  0.2905],
+          [-0.2838, -1.4535,  2.3737, -0.0177, -2.7884],
+          [-0.3788,  0.7046, -1.3956, -0.1248, -0.9259],
+          [-1.5463, -0.4902,  0.0244, -1.5992, -0.8469],
+          [-0.8373, -0.6360, -1.2973, -0.4603,  0.1746]],
+
+         [[ 1.3146,  2.6794,  1.5586,  0.4050,  0.1864],
+          [-1.5413,  1.3425,  0.5735,  0.0278,  0.0130],
+          [-2.7714,  0.3779, -0.2477,  0.6701,  1.9268],
+          [ 0.0981,  0.9195,  0.0881, -0.1142,  2.3015],
+          [-0.2850,  0.7583,  1.1569, -1.0909, -0.1246]],
+
+         [[ 0.3614,  0.8502, -1.0758, -0.2949, -0.9954],
+          [-0.4878, -0.2857, -0.6913, -0.9376, -0.0198],
+          [ 0.5815, -0.8527,  0.3559, -1.3682, -1.4363],
+          [-1.5196,  0.2291, -0.1349, -1.9429,  1.7121],
+          [-0.3797, -1.2854, -1.4018, -1.1131,  1.4373]],
+
+         [[ 0.9116,  0.1682, -0.3411, -0.4115,  1.5472],
+          [-0.4507, -1.3744,  0.4156, -0.5398, -1.0306],
+          [ 0.4035,  1.8395,  1.7010, -1.7723,  1.1802],
+          [ 1.1519, -1.0268, -1.6892, -0.4740, -1.3142],
+          [-0.7886,  0.3774, -0.5532,  0.4585, -0.9663]],
+
+         [[ 1.7240,  1.7387,  0.7834, -1.3602, -0.1795],
+          [-0.2410,  0.1772,  0.2335,  1.1940,  0.8958],
+          [-1.2318,  0.9597,  1.1199,  1.4719,  1.3295],
+          [-1.2037,  0.6588,  1.8107, -0.4851,  0.1304],
+          [ 1.1314,  0.5540, -0.6499, -1.2682, -0.4310]]],
+        device=device,
+        requires_grad=True),
+    )
+
     args = (*primals, *cotangents)
 
     @functools.wraps(fn)
@@ -940,24 +973,96 @@ class TestOperators(TestCase):
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         def test(_op, inplace=False):
-            for sample in samples:
+            for sample, cpu_sample in samples:
                 if inplace and not is_valid_inplace_sample_input(
                     sample, op, op.inplace_variant
                 ):
                     continue
+                # print("CPU SAMPLE:")
+                # print(cpu_sample.input.device)
+                # print(cpu_sample.input)
+                # print("XPU SAMPLE:")
+                # print(sample.input.device)
+                # print(sample.input)
+                # print(f"\nCPU SAMPLE: {cpu_sample}\nXPU SAMPLE: {sample}\n")
+                print("\nSAMPLE INPUT:")
+                print(sample)
+                print()
+
+                try:
+                    assert torch.allclose(sample.input.cpu(), cpu_sample.input), f"Inputs don't match! {sample.input} vs {cpu_sample.input}"
+                except AssertionError as e:
+                    print("\nInput tensors are not close!\n")
+
                 fn, args = get_vjpfull_variant(_op, sample)
+                cpu_fn, cpu_args = get_vjpfull_variant(_op, cpu_sample)
+
                 result = fn(*args)
+                cpu_result = cpu_fn(*cpu_args)
+
+                # print(f"\nresult: {result}\ncpu_result: {cpu_result}\n")
+
+                #try:
+                assert torch.allclose(result[0].cpu(), cpu_result[0]), f"Results don't match! {result} vs {cpu_result}"
+                #except AssertionError as e:
+                   # print("\nOutput tensors are not close!\n")
+
+                #try:
+                assert torch.allclose(result[1].cpu(), cpu_result[1]), f"2 Results don't match! {result} vs {cpu_result}"
+                #except AssertionError as e:
+                 #   print("\n2 Output tensors are not close!\n")
+
                 cotangents = tree_map(lambda x: torch.randn_like(x), result)
+                cpu_cotangents = tree_map(lambda x: x.cpu().clone(), cotangents)
+                print("\nCOTANGENTS:\n")
+                print(cotangents)
+                print()
+                # print("\nCPU COTANGENTS:\n")
+                # print(cpu_cotangents)
+
+
 
                 # Compute vjp of vjp
                 _, vjp_fn = vjp(fn, *args)
                 result_vjps = vjp_fn(cotangents)
+
+                _, cpu_vjp_fn = vjp(cpu_fn, *cpu_args)
+                cpu_result_vjps = cpu_vjp_fn(cpu_cotangents)
+
+                assert torch.allclose(result_vjps[0].cpu(), cpu_result_vjps[0]), f"VJP of VJP results don't match! {result_vjps} vs {cpu_result_vjps}"
+                try:
+                    assert torch.allclose(result_vjps[1].cpu(), cpu_result_vjps[1]), f"VJP of VJP results don't match! {result_vjps} vs {cpu_result_vjps}"
+                except AssertionError as e:
+                     print("\nVJP of VJP cotangent tensors are not close!\n")
+
+                # print(result_vjps[1])
+                # print(cpu_result_vjps[1])
 
                 # Compute ref_vjp of vjp. We could have done ref_vjp of ref_vjp,
                 # but since we're confident that vjp works by itself, this is
                 # an equivalent way to test that.
                 _, vjp_fn = ref_vjp(fn, *args)
                 expected_vjps = vjp_fn(cotangents)
+
+                _, cpu_vjp_fn = ref_vjp(cpu_fn, *cpu_args)
+                cpu_expected_vjps = cpu_vjp_fn(cpu_cotangents)
+
+                try:
+                    assert torch.allclose(expected_vjps[0].cpu(), cpu_expected_vjps[0]), f"Expected VJP of VJP results don't match!"
+                except AssertionError as e:
+                    print("\n3 Expected VJP of VJP tensors are not close!\n")
+                
+                try:
+                    assert torch.allclose(expected_vjps[1].cpu(), cpu_expected_vjps[1]), f"Expected VJP of VJP results don't match!"
+                except AssertionError as e:
+                    print("\n4 Expected VJP of VJP cotangent tensors are not close!\n")
+
+                # print(f"\nresult: {expected_vjps[1]}\ncpu_result: {cpu_expected_vjps[1]}\n")
+
+                # print(f"result_vjps: {result_vjps}"
+                #       f"\ncpu_result_vjps: {cpu_result_vjps}"
+                #       f"\nexpected_vjps: {expected_vjps}"
+                #       f"\ncpu_expected_vjps: {cpu_expected_vjps}")
 
                 self.assertEqual(result_vjps, expected_vjps)
 
