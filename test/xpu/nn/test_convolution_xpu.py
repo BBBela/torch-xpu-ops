@@ -1407,6 +1407,44 @@ with XPUPatchForImport(False):
             result, input.grad.data, atol=dtype2prec_DONTUSE[dtype], rtol=0
         )
 
+    @dtypes(torch.float)
+    def conv2d_nonzero_storage_offset(self, device, dtype):
+        lhs = (
+            torch.arange(2 * 1 * 4 * 5 * 5, device=device, dtype=dtype) / 17.0
+        ).reshape(2, 1, 4, 5, 5)
+        rhs = (
+            torch.arange(2 * 1 * 4 * 2 * 3, device=device, dtype=dtype) / 13.0
+        ).reshape(2, 1, 4, 2, 3)
+
+        lhs_view = lhs[1]
+        rhs_view = rhs[1]
+        self.assertNotEqual(lhs_view.storage_offset(), 0)
+        self.assertNotEqual(rhs_view.storage_offset(), 0)
+
+        lhs_zero_offset = lhs_view.clone()
+        rhs_zero_offset = rhs_view.clone()
+
+        y_view = F.conv2d(
+            lhs_view,
+            rhs_view,
+            bias=None,
+            stride=(2, 2),
+            padding=(1, 1),
+            dilation=(2, 3),
+            groups=1,
+        )
+        y_zero_offset = F.conv2d(
+            lhs_zero_offset,
+            rhs_zero_offset,
+            bias=None,
+            stride=(2, 2),
+            padding=(1, 1),
+            dilation=(2, 3),
+            groups=1,
+        )
+
+        self.assertEqual(y_view, y_zero_offset, atol=1e-5, rtol=1e-5)
+
     def skip_cudnn_test(self, *args, **kwargs):
         self.skipTest("This is a cuDNN-specific test not applicable to XPU.")
 
@@ -1438,6 +1476,9 @@ with XPUPatchForImport(False):
     TestConvolutionNNDeviceType.test_Conv2d_large_workspace = conv2d_large_workspace
     TestConvolutionNNDeviceType.test_Conv2d_naive_groups = conv2d_naive_groups
     TestConvolutionNNDeviceType.test_noncontig_conv_grad = noncontig_conv_grad
+    TestConvolutionNNDeviceType.test_conv2d_nonzero_storage_offset = (
+        conv2d_nonzero_storage_offset
+    )
     TestConvolutionNN.test_Conv2d_inconsistent_types_on_GPU_with_cudnn = (
         conv2d_inconsistent_types_on_GPU_with_mkldnn
     )
