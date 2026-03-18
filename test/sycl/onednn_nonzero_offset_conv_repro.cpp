@@ -1,4 +1,3 @@
-#include <oneapi/dnnl/dnnl.h>
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
@@ -7,9 +6,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -23,11 +19,6 @@ using dnnl::memory;
 using dnnl::prop_kind;
 using dnnl::stream;
 
-struct Metrics {
-  float max_abs = 0.0f;
-  float mean_abs = 0.0f;
-};
-
 struct Options {
   int device_index = 0;
   float atol = 1.0e-4f;
@@ -38,38 +29,21 @@ static int64_t output_size_1d(int64_t in, int64_t k, int64_t s, int64_t p, int64
   return (in + 2 * p - kernel) / s + 1;
 }
 
-static Metrics compare(const std::vector<float>& a, const std::vector<float>& b) {
+static float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
   if (a.size() != b.size()) {
-    throw std::runtime_error("compare size mismatch");
+    throw std::runtime_error("size mismatch");
   }
-  Metrics m;
-  double sum = 0.0;
+  float mx = 0.0f;
   for (size_t i = 0; i < a.size(); ++i) {
-    const float d = std::abs(a[i] - b[i]);
-    m.max_abs = std::max(m.max_abs, d);
-    sum += d;
+    mx = std::max(mx, std::abs(a[i] - b[i]));
   }
-  m.mean_abs = static_cast<float>(sum / static_cast<double>(a.size()));
-  return m;
+  return mx;
 }
 
-static void naive_conv2d(
-    const std::vector<float>& src,
-    const std::vector<float>& wei,
-    std::vector<float>& dst,
-    int64_t n,
-    int64_t c,
-    int64_t h,
-    int64_t w,
-    int64_t o,
-    int64_t kh,
-    int64_t kw,
-    int64_t sh,
-    int64_t sw,
-    int64_t ph,
-    int64_t pw,
-    int64_t dh,
-    int64_t dw) {
+static void cpu_conv2d_ref(const std::vector<float>& src, const std::vector<float>& wei, std::vector<float>& dst,
+    int64_t n, int64_t c, int64_t h, int64_t w, int64_t o, int64_t kh, int64_t kw, int64_t sh, int64_t sw,
+    int64_t ph, int64_t pw, int64_t dh, int64_t dw)
+{
   const int64_t oh = output_size_1d(h, kh, sh, ph, dh);
   const int64_t ow = output_size_1d(w, kw, sw, pw, dw);
 
@@ -122,24 +96,10 @@ static T* alloc_shared(const engine& eng, size_t n) {
   return p;
 }
 
-static std::vector<float> run_onednn_conv(
-    const engine& eng,
-    stream& strm,
-    float* src_ptr,
-    float* wei_ptr,
-    int64_t n,
-    int64_t c,
-    int64_t h,
-    int64_t w,
-    int64_t o,
-    int64_t kh,
-    int64_t kw,
-    int64_t sh,
-    int64_t sw,
-    int64_t ph,
-    int64_t pw,
-    int64_t dh,
-    int64_t dw) {
+static std::vector<float> run_onednn_conv(const engine& eng, stream& strm, float* src_ptr, float* wei_ptr,
+    int64_t n, int64_t c, int64_t h, int64_t w, int64_t o, int64_t kh, int64_t kw, int64_t sh, int64_t sw,
+    int64_t ph, int64_t pw, int64_t dh, int64_t dw)
+{
   const int64_t oh = output_size_1d(h, kh, sh, ph, dh);
   const int64_t ow = output_size_1d(w, kw, sw, pw, dw);
   const int64_t dst_n = n * o * oh * ow;
@@ -150,7 +110,6 @@ static std::vector<float> run_onednn_conv(
   memory::dims src_dims = {n, c, h, w};
   memory::dims wei_dims = {o, c, kh, kw};
   memory::dims dst_dims = {n, o, oh, ow};
-
   memory::dims strides = {sh, sw};
   memory::dims dilates = {dh - 1, dw - 1};
   memory::dims pad_l = {ph, pw};
@@ -164,17 +123,8 @@ static std::vector<float> run_onednn_conv(
   auto wei_m = dnnl::sycl_interop::make_memory(wei_md, eng, dnnl::sycl_interop::memory_kind::usm, wei_ptr);
   auto dst_m = dnnl::sycl_interop::make_memory(dst_md, eng, dnnl::sycl_interop::memory_kind::usm, dst_ptr);
 
-  auto pd = convolution_forward::primitive_desc(
-      eng,
-      prop_kind::forward_training,
-      algorithm::convolution_direct,
-      src_md,
-      wei_md,
-      dst_md,
-      strides,
-      dilates,
-      pad_l,
-      pad_r);
+  auto pd = convolution_forward::primitive_desc(eng, prop_kind::forward_training, algorithm::convolution_direct,
+      src_md, wei_md, dst_md, strides, dilates, pad_l, pad_r);
   auto conv = convolution_forward(pd);
 
   std::unordered_map<int, memory> args;
@@ -193,28 +143,8 @@ static std::vector<float> run_onednn_conv(
   return out;
 }
 
-static Options parse_args(int argc, char** argv) {
-  Options opt;
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--device-index" && i + 1 < argc) {
-      opt.device_index = std::stoi(argv[++i]);
-    } else if (arg == "--atol" && i + 1 < argc) {
-      opt.atol = std::stof(argv[++i]);
-    } else if (arg == "--help") {
-      std::cout << "Usage: onednn_nonzero_offset_conv_repro [--device-index N] [--atol X]\n";
-      std::exit(0);
-    } else {
-      throw std::runtime_error("Unknown argument: " + arg);
-    }
-  }
-  return opt;
-}
-
 int main(int argc, char** argv) {
   try {
-    const Options opt = parse_args(argc, argv);
-
     if (engine::get_count(engine::kind::gpu) == 0) {
       std::cerr << "No oneDNN GPU engine found.\n";
       return 2;
@@ -223,12 +153,13 @@ int main(int argc, char** argv) {
     auto v = dnnl_version();
     std::cout << "oneDNN version: " << v->major << "." << v->minor << "." << v->patch << "\n";
 
+    const Options opt{};
     engine eng(engine::kind::gpu, opt.device_index);
     stream strm(eng);
     auto dev = dnnl::sycl_interop::get_device(eng);
     std::cout << "SYCL device: " << dev.get_info<sycl::info::device::name>() << "\n";
 
-    // Tiny failing shape discovered in PyTorch XPU path.
+    // Minimal failing shape derived from the PyTorch issue.
     const int64_t n = 1, c = 4, h = 5, w = 5;
     const int64_t o = 1, kh = 2, kw = 3;
     const int64_t sh = 2, sw = 2, ph = 1, pw = 1, dh = 2, dw = 3;
@@ -237,6 +168,8 @@ int main(int argc, char** argv) {
     const int64_t wei_compact_n = o * c * kh * kw; // 24
     const int64_t src_full_n = 2 * src_compact_n; // 200
     const int64_t wei_full_n = 2 * wei_compact_n; // 48
+    const int64_t src_offset = src_compact_n; // intentionally unaligned for fp32
+    const int64_t wei_offset = wei_compact_n;
 
     std::vector<float> src_full_h(static_cast<size_t>(src_full_n));
     std::vector<float> wei_full_h(static_cast<size_t>(wei_full_n));
@@ -247,127 +180,61 @@ int main(int argc, char** argv) {
       wei_full_h[static_cast<size_t>(i)] = static_cast<float>(i) / 13.0f;
     }
 
-    const int64_t oh = output_size_1d(h, kh, sh, ph, dh);
-    const int64_t ow = output_size_1d(w, kw, sw, pw, dw);
-
-    float* src_full_d = alloc_shared<float>(eng, static_cast<size_t>(src_full_n));
-    float* wei_full_d = alloc_shared<float>(eng, static_cast<size_t>(wei_full_n));
-    std::copy(src_full_h.begin(), src_full_h.end(), src_full_d);
-    std::copy(wei_full_h.begin(), wei_full_h.end(), wei_full_d);
-    auto run_case = [&](const std::string& name, int64_t src_offset, int64_t wei_offset) {
-      std::vector<float> src_compact_h(
+    std::vector<float> src_compact_h(
         src_full_h.begin() + src_offset,
         src_full_h.begin() + src_offset + src_compact_n);
-      std::vector<float> wei_compact_h(
+    std::vector<float> wei_compact_h(
         wei_full_h.begin() + wei_offset,
         wei_full_h.begin() + wei_offset + wei_compact_n);
 
-      std::vector<float> ref(static_cast<size_t>(n * o * oh * ow), 0.0f);
-      naive_conv2d(
-        src_compact_h,
-        wei_compact_h,
-        ref,
-        n,
-        c,
-        h,
-        w,
-        o,
-        kh,
-        kw,
-        sh,
-        sw,
-        ph,
-        pw,
-        dh,
-        dw);
+    const int64_t oh = output_size_1d(h, kh, sh, ph, dh);
+    const int64_t ow = output_size_1d(w, kw, sw, pw, dw);
+    std::vector<float> ref(static_cast<size_t>(n * o * oh * ow), 0.0f);
+    cpu_conv2d_ref(src_compact_h, wei_compact_h, ref, n, c, h, w, o, kh, kw, sh, sw, ph, pw, dh, dw);
 
-      float* src_compact_d = alloc_shared<float>(eng, static_cast<size_t>(src_compact_n));
-      float* wei_compact_d = alloc_shared<float>(eng, static_cast<size_t>(wei_compact_n));
-      std::copy(src_compact_h.begin(), src_compact_h.end(), src_compact_d);
-      std::copy(wei_compact_h.begin(), wei_compact_h.end(), wei_compact_d);
+    float* src_full_d = alloc_shared<float>(eng, static_cast<size_t>(src_full_n));
+    float* wei_full_d = alloc_shared<float>(eng, static_cast<size_t>(wei_full_n));
+    float* src_compact_d = alloc_shared<float>(eng, static_cast<size_t>(src_compact_n));
+    float* wei_compact_d = alloc_shared<float>(eng, static_cast<size_t>(wei_compact_n));
 
-      float* src_offset_ptr = src_full_d + src_offset;
-      float* wei_offset_ptr = wei_full_d + wei_offset;
+    std::copy(src_full_h.begin(), src_full_h.end(), src_full_d);
+    std::copy(wei_full_h.begin(), wei_full_h.end(), wei_full_d);
+    std::copy(src_compact_h.begin(), src_compact_h.end(), src_compact_d);
+    std::copy(wei_compact_h.begin(), wei_compact_h.end(), wei_compact_d);
 
-      std::cout << "[" << name << "] src_offset(elements): " << src_offset
-          << " ptr_mod64=" << (reinterpret_cast<uintptr_t>(src_offset_ptr) % 64) << "\n";
-      std::cout << "[" << name << "] wei_offset(elements): " << wei_offset
-          << " ptr_mod64=" << (reinterpret_cast<uintptr_t>(wei_offset_ptr) % 64) << "\n";
+    float* src_offset_ptr = src_full_d + src_offset;
+    float* wei_offset_ptr = wei_full_d + wei_offset;
 
-      auto out_compact = run_onednn_conv(
-        eng,
-        strm,
-        src_compact_d,
-        wei_compact_d,
-        n,
-        c,
-        h,
-        w,
-        o,
-        kh,
-        kw,
-        sh,
-        sw,
-        ph,
-        pw,
-        dh,
-        dw);
-      auto out_offset = run_onednn_conv(
-        eng,
-        strm,
-        src_offset_ptr,
-        wei_offset_ptr,
-        n,
-        c,
-        h,
-        w,
-        o,
-        kh,
-        kw,
-        sh,
-        sw,
-        ph,
-        pw,
-        dh,
-        dw);
+    std::cout << "src_offset(elements): " << src_offset
+              << " ptr_mod64=" << (reinterpret_cast<uintptr_t>(src_offset_ptr) % 64) << "\n";
+    std::cout << "wei_offset(elements): " << wei_offset
+              << " ptr_mod64=" << (reinterpret_cast<uintptr_t>(wei_offset_ptr) % 64) << "\n";
 
-      auto compact_vs_ref = compare(out_compact, ref);
-      auto offset_vs_ref = compare(out_offset, ref);
-      auto offset_vs_compact = compare(out_offset, out_compact);
+    auto out_compact = run_onednn_conv(eng, strm, src_compact_d, wei_compact_d, n, c, h, w, o, kh, kw, sh, sw, ph, pw, dh, dw);
+    auto out_offset = run_onednn_conv(eng, strm, src_offset_ptr, wei_offset_ptr, n, c, h, w, o, kh, kw, sh, sw, ph, pw, dh, dw);
 
-      const bool compact_pass = compact_vs_ref.max_abs <= opt.atol;
-      const bool offset_pass = offset_vs_compact.max_abs <= opt.atol;
+    const float compact_vs_ref = max_abs_diff(out_compact, ref);
+    const float offset_vs_ref = max_abs_diff(out_offset, ref);
+    const float offset_vs_compact = max_abs_diff(out_offset, out_compact);
 
-      std::cout << std::setprecision(8)
-          << "[" << name << "] compact_vs_ref: max_abs=" << compact_vs_ref.max_abs
-          << " mean_abs=" << compact_vs_ref.mean_abs << "\n"
-          << "[" << name << "] offset_vs_ref: max_abs=" << offset_vs_ref.max_abs
-          << " mean_abs=" << offset_vs_ref.mean_abs << "\n"
-          << "[" << name << "] offset_vs_compact: max_abs=" << offset_vs_compact.max_abs
-          << " mean_abs=" << offset_vs_compact.mean_abs << "\n";
+    const bool compact_control_pass = compact_vs_ref <= opt.atol;
+    const bool offset_diverges = offset_vs_compact > opt.atol;
 
-      std::cout << "[" << name << "] ref_head: [" << ref[0] << ", " << ref[1] << ", " << ref[2] << "]\n";
-      std::cout << "[" << name << "] compact_head: [" << out_compact[0] << ", " << out_compact[1] << ", " << out_compact[2] << "]\n";
-      std::cout << "[" << name << "] offset_head: [" << out_offset[0] << ", " << out_offset[1] << ", " << out_offset[2] << "]\n";
+    std::cout << "compact_vs_ref max_abs=" << compact_vs_ref << "\n";
+    std::cout << "offset_vs_ref max_abs=" << offset_vs_ref << "\n";
+    std::cout << "offset_vs_compact max_abs=" << offset_vs_compact << "\n";
 
-      std::cout << "CASE " << name << "_compact_control => "
-          << (compact_pass ? "PASS" : "FAIL") << " (atol=" << opt.atol << ")\n";
-      std::cout << "CASE " << name << "_offset_vs_compact => "
-          << (offset_pass ? "PASS" : "FAIL") << " (atol=" << opt.atol << ")\n";
-
-      auto ctx = dnnl::sycl_interop::get_context(eng);
-      sycl::free(src_compact_d, ctx);
-      sycl::free(wei_compact_d, ctx);
-      return compact_pass && offset_pass;
-    };
-
-    const bool unaligned_ok = run_case("offset_unaligned", src_compact_n, wei_compact_n);
-    const bool aligned_ok = run_case("offset_aligned", src_compact_n - 4, wei_compact_n - 8);
+    std::cout << "ref_head: [" << ref[0] << ", " << ref[1] << ", " << ref[2] << "]\n";
+    std::cout << "compact_head: [" << out_compact[0] << ", " << out_compact[1] << ", " << out_compact[2] << "]\n";
+    std::cout << "offset_head: [" << out_offset[0] << ", " << out_offset[1] << ", " << out_offset[2] << "]\n";
 
     auto ctx = dnnl::sycl_interop::get_context(eng);
     sycl::free(src_full_d, ctx);
     sycl::free(wei_full_d, ctx);
-    return (unaligned_ok && aligned_ok) ? 0 : 1;
+    sycl::free(src_compact_d, ctx);
+    sycl::free(wei_compact_d, ctx);
+
+    return (compact_control_pass && offset_diverges) ? 0 : 1;
   } catch (const dnnl::error& e) {
     std::cerr << "oneDNN error: " << e.what() << " | status=" << e.status << "\n";
     return 10;

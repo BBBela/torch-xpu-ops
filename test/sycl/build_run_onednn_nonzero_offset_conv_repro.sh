@@ -26,9 +26,6 @@ echo "[build] compiler: ${cxx}"
   -L/lib/x86_64-linux-gnu -ldl -lpthread -lm -lgomp -l:libOpenCL.so.1 \
   -o "${out}"
 
-echo "[run] ${out} --device-index 0"
-DNNL_VERBOSE=1 ONEDNN_VERBOSE=1 "${out}" --device-index 0
+echo "[run] ${out}"
+DNNL_VERBOSE=1 ONEDNN_VERBOSE=1 "${out}"
 
-echo
-echo "Tip: override tolerance and device"
-echo "  ${out} --device-index 0 --atol 1e-4"
